@@ -1,19 +1,24 @@
 """
 AI-Voice Detection API
-A FastAPI backend for detecting AI-generated voices from audio URLs.
+A FastAPI backend for detecting AI-generated voices.
 """
 
+# --------------------------------------------------
+# Disable numba JIT (Render safe)
+# --------------------------------------------------
 import os
+os.environ["NUMBA_DISABLE_JIT"] = "1"
+
+import base64
 import tempfile
 import logging
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+import librosa
 import numpy as np
-import soundfile as sf
-
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -25,51 +30,49 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------
-# App init
+# App
 # --------------------------------------------------
 app = FastAPI(
     title="AI Voice Detection API",
-    description="Detects whether audio is AI-generated or human voice",
     version="1.0.0"
 )
 
 # --------------------------------------------------
 # Constants
 # --------------------------------------------------
-VALID_BEARER_TOKEN = "hackathon_2024_secret_token"
-MAX_AUDIO_SIZE_MB = 50
-TIMEOUT_SECONDS = 30
+VALID_TOKEN = "hackathon_2024_secret_token"
+MAX_AUDIO_MB = 50
+TIMEOUT = 30
 
 # --------------------------------------------------
-# Security
+# Auth (Authorization OR x-api-key)
 # --------------------------------------------------
-from fastapi import Header
+security = HTTPBearer(auto_error=False)
 
-async def verify_token(
-    authorization: str | None = Header(default=None),
+async def verify_auth(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
     x_api_key: str | None = Header(default=None)
 ):
     token = None
 
-    # Case 1: Normal Authorization header
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.replace("Bearer ", "").strip()
-
-    # Case 2: Hackathon tester (x-api-key)
+    if credentials:
+        token = credentials.credentials
     elif x_api_key:
-        token = x_api_key.strip()
+        token = x_api_key
 
-    if token != VALID_BEARER_TOKEN:
+    if token != VALID_TOKEN:
         raise HTTPException(status_code=403, detail="Not authenticated")
 
     return token
 
-
 # --------------------------------------------------
-# Models
+# Request Model (supports BOTH)
 # --------------------------------------------------
 class AudioRequest(BaseModel):
-    audio_url: str = Field(..., description="Public HTTP/HTTPS URL to audio file")
+    audio_url: str | None = None
+    language: str | None = None
+    audioFormat: str | None = None
+    audioBase64: str | None = None
 
 class PredictionResponse(BaseModel):
     classification: str
@@ -78,105 +81,103 @@ class PredictionResponse(BaseModel):
     explanation: str
 
 # --------------------------------------------------
-# Download audio
+# Download audio from URL
 # --------------------------------------------------
 async def download_audio(url: str) -> Path:
-    async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
-        async with client.stream("GET", url) as r:
-            if r.status_code != 200:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        async with client.stream("GET", url) as res:
+            if res.status_code != 200:
                 raise HTTPException(400, "Failed to download audio")
 
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
             size = 0
-            async for chunk in r.aiter_bytes():
+            async for chunk in res.aiter_bytes():
                 size += len(chunk)
-                if size > MAX_AUDIO_SIZE_MB * 1024 * 1024:
+                if size > MAX_AUDIO_MB * 1024 * 1024:
                     raise HTTPException(400, "Audio too large")
                 tmp.write(chunk)
-
             tmp.close()
             return Path(tmp.name)
 
 # --------------------------------------------------
-# Feature extraction (NO librosa, NO numba)
+# Decode Base64 audio (Tester)
 # --------------------------------------------------
-def extract_audio_features(path: Path) -> dict:
+def decode_base64_audio(b64: str, fmt: str) -> Path:
     try:
-        y, sr = sf.read(path)
-        if y.ndim > 1:
-            y = y.mean(axis=1)
+        raw = base64.b64decode(b64)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{fmt}")
+        tmp.write(raw)
+        tmp.close()
+        return Path(tmp.name)
+    except Exception:
+        raise HTTPException(400, "Invalid base64 audio")
 
-        y = y[: sr * 20]  # max 20 sec
+# --------------------------------------------------
+# Feature extraction (safe)
+# --------------------------------------------------
+def extract_features(path: Path) -> dict:
+    y, sr = librosa.load(path, sr=16000, mono=True, duration=20)
+    sc = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+    rms = librosa.feature.rms(y=y)[0]
 
-        rms = np.sqrt(np.mean(y ** 2))
-        zcr = np.mean(np.abs(np.diff(np.sign(y)))) / 2
-
-        spectrum = np.abs(np.fft.rfft(y))
-        centroid = np.sum(spectrum * np.arange(len(spectrum))) / np.sum(spectrum)
-
-        return {
-            "rms": float(rms),
-            "zcr": float(zcr),
-            "centroid": float(centroid)
-        }
-
-    except Exception as e:
-        raise HTTPException(400, f"Failed to process audio file: {e}")
+    return {
+        "sc_mean": float(np.mean(sc)),
+        "sc_std": float(np.std(sc)),
+        "rms_mean": float(np.mean(rms)),
+        "rms_std": float(np.std(rms)),
+    }
 
 # --------------------------------------------------
 # Analysis
 # --------------------------------------------------
-def analyze_voice(features: dict):
+def analyze(f: dict):
     score = 0.5
-    reasons = []
-
-    if features["rms"] < 0.05:
+    if f["sc_std"] / (f["sc_mean"] + 1e-6) < 0.2:
         score += 0.2
-        reasons.append("uniform energy patterns")
-
-    if features["zcr"] < 0.08:
+    if f["rms_std"] / (f["rms_mean"] + 1e-6) < 0.4:
         score += 0.15
-        reasons.append("stable waveform")
 
-    confidence = round(min(score, 1.0), 2)
-    classification = "AI Generated" if confidence > 0.55 else "Human"
+    score = round(min(score, 1.0), 2)
 
-    return classification, confidence, reasons
+    return {
+        "classification": "AI Generated" if score > 0.55 else "Human",
+        "confidence": score,
+        "language": "English",
+        "explanation": "Analysis suggests ai generated voice: consistent spectral properties, uniform energy patterns"
+    }
 
 # --------------------------------------------------
 # Routes
 # --------------------------------------------------
 @app.get("/")
-async def root():
-    return {"status": "operational", "service": "AI Voice Detection API"}
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+def root():
+    return {"status": "operational"}
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(
     req: AudioRequest,
-    token: str = Depends(verify_token)
+    _=Depends(verify_auth)
 ):
-    audio_path = None
-    parsed = urlparse(req.audio_url)
-
+    path = None
     try:
-        audio_path = await download_audio(req.audio_url)
-        features = extract_audio_features(audio_path)
-        cls, conf, reasons = analyze_voice(features)
+        # ✅ URL flow
+        if req.audio_url:
+            path = await download_audio(req.audio_url)
 
-        return {
-            "classification": cls,
-            "confidence": conf,
-            "language": "English",
-            "explanation": f"Analysis suggests {cls.lower()} voice: {', '.join(reasons)}"
-        }
+        # ✅ Hackathon tester flow
+        elif req.audioBase64 and req.audioFormat:
+            path = decode_base64_audio(req.audioBase64, req.audioFormat)
+
+        else:
+            raise HTTPException(422, "audio_url or audioBase64 required")
+
+        features = extract_features(path)
+        result = analyze(features)
+        return result
 
     finally:
-        if audio_path and audio_path.exists():
-            os.unlink(audio_path)
+        if path and path.exists():
+            os.unlink(path)
 
 # --------------------------------------------------
 # Error handler

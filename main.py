@@ -1,21 +1,22 @@
 """
 AI-Voice Detection API
-Stable, hackathon-safe, Render-safe implementation
+A FastAPI backend for detecting AI-generated voices from audio URLs.
 """
+
+import os
+import tempfile
+import logging
+from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx
+import numpy as np
+import soundfile as sf
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from urllib.parse import urlparse
-from pathlib import Path
-import httpx
-import librosa
-import numpy as np
-import soundfile as sf
-import tempfile
-import os
-import logging
 
 # --------------------------------------------------
 # Logging
@@ -55,7 +56,7 @@ async def verify_token(
 # Models
 # --------------------------------------------------
 class AudioRequest(BaseModel):
-    audio_url: str = Field(..., description="Public audio URL (mp3/wav)")
+    audio_url: str = Field(..., description="Public HTTP/HTTPS URL to audio file")
 
 class PredictionResponse(BaseModel):
     classification: str
@@ -64,54 +65,50 @@ class PredictionResponse(BaseModel):
     explanation: str
 
 # --------------------------------------------------
-# Audio download
+# Download audio
 # --------------------------------------------------
 async def download_audio(url: str) -> Path:
     async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
-        r = await client.get(url)
-        if r.status_code != 200:
-            raise HTTPException(400, "Failed to download audio")
+        async with client.stream("GET", url) as r:
+            if r.status_code != 200:
+                raise HTTPException(400, "Failed to download audio")
 
-        suffix = ".wav" if ".wav" in url else ".mp3"
-        f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        f.write(r.content)
-        f.close()
-        return Path(f.name)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            size = 0
+            async for chunk in r.aiter_bytes():
+                size += len(chunk)
+                if size > MAX_AUDIO_SIZE_MB * 1024 * 1024:
+                    raise HTTPException(400, "Audio too large")
+                tmp.write(chunk)
+
+            tmp.close()
+            return Path(tmp.name)
 
 # --------------------------------------------------
-# 🔥 STABLE FEATURE EXTRACTION (NO NUMBA)
+# Feature extraction (NO librosa, NO numba)
 # --------------------------------------------------
-def extract_audio_features(audio_path: Path) -> dict:
+def extract_audio_features(path: Path) -> dict:
     try:
-        y, sr = sf.read(audio_path, always_2d=False)
-
+        y, sr = sf.read(path)
         if y.ndim > 1:
-            y = np.mean(y, axis=1)
+            y = y.mean(axis=1)
 
-        y = y[: sr * 20]  # max 20 seconds
+        y = y[: sr * 20]  # max 20 sec
 
-        features = {}
+        rms = np.sqrt(np.mean(y ** 2))
+        zcr = np.mean(np.abs(np.diff(np.sign(y)))) / 2
 
-        spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        zcr = librosa.feature.zero_crossing_rate(y)[0]
-        rms = librosa.feature.rms(y=y)[0]
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5)
+        spectrum = np.abs(np.fft.rfft(y))
+        centroid = np.sum(spectrum * np.arange(len(spectrum))) / np.sum(spectrum)
 
-        features["spectral_centroid_mean"] = float(np.mean(spectral_centroid))
-        features["spectral_centroid_std"] = float(np.std(spectral_centroid))
-        features["zcr_mean"] = float(np.mean(zcr))
-        features["zcr_std"] = float(np.std(zcr))
-        features["rms_mean"] = float(np.mean(rms))
-        features["rms_std"] = float(np.std(rms))
-
-        for i in range(5):
-            features[f"mfcc_{i}_mean"] = float(np.mean(mfcc[i]))
-            features[f"mfcc_{i}_std"] = float(np.std(mfcc[i]))
-
-        return features
+        return {
+            "rms": float(rms),
+            "zcr": float(zcr),
+            "centroid": float(centroid)
+        }
 
     except Exception as e:
-        raise HTTPException(400, f"Failed to process audio file: {str(e)}")
+        raise HTTPException(400, f"Failed to process audio file: {e}")
 
 # --------------------------------------------------
 # Analysis
@@ -120,15 +117,15 @@ def analyze_voice(features: dict):
     score = 0.5
     reasons = []
 
-    if features["spectral_centroid_std"] < 0.15 * features["spectral_centroid_mean"]:
+    if features["rms"] < 0.05:
         score += 0.2
-        reasons.append("consistent spectral properties")
-
-    if features["rms_std"] < 0.4 * features["rms_mean"]:
-        score += 0.15
         reasons.append("uniform energy patterns")
 
-    confidence = round(min(max(score, 0), 1), 2)
+    if features["zcr"] < 0.08:
+        score += 0.15
+        reasons.append("stable waveform")
+
+    confidence = round(min(score, 1.0), 2)
     classification = "AI Generated" if confidence > 0.55 else "Human"
 
     return classification, confidence, reasons
@@ -145,13 +142,15 @@ async def health():
     return {"status": "healthy"}
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict_voice(
-    request: AudioRequest,
+async def predict(
+    req: AudioRequest,
     token: str = Depends(verify_token)
 ):
     audio_path = None
+    parsed = urlparse(req.audio_url)
+
     try:
-        audio_path = await download_audio(request.audio_url)
+        audio_path = await download_audio(req.audio_url)
         features = extract_audio_features(audio_path)
         cls, conf, reasons = analyze_voice(features)
 

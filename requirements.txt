@@ -3,10 +3,11 @@ uvicorn==0.27.0
 pydantic==2.5.3
 httpx==0.26.0
 
-# 🔥 AUDIO STACK (STABLE)
-librosa==0.10.1
-numpy==1.26.4
-scipy==1.11.4
-soundfile==0.12.1
+# 🔒 HARD-LOCK AUDIO STACK (Render safe)
+librosa==0.9.2
+numpy==1.23.5
+scipy==1.9.3
+numba==0.56.4
 
+soundfile==0.12.1
 python-multipart==0.0.6

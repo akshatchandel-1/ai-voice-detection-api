@@ -23,12 +23,11 @@ COPY main.py .
 RUN useradd -m -u 1000 apiuser && chown -R apiuser:apiuser /app
 USER apiuser
 
-# Expose port
+# 🔥 CRITICAL: Prevent numba/librosa JIT memory crash on Render
+ENV NUMBA_DISABLE_JIT=1
+
+# Expose port (Render ignores this but good practice)
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/health')"
-
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the application (Render-compatible)
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

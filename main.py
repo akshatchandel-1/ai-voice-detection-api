@@ -15,12 +15,12 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import Optional
 import httpx
 import librosa
 import numpy as np
 import tempfile
 import logging
+import warnings
 
 # --------------------------------------------------
 # Logging
@@ -52,10 +52,9 @@ security = HTTPBearer()
 async def verify_token(
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
-    token = credentials.credentials
-    if token != VALID_BEARER_TOKEN:
+    if credentials.credentials != VALID_BEARER_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid authentication token")
-    return token
+    return credentials.credentials
 
 # --------------------------------------------------
 # Models
@@ -88,8 +87,8 @@ async def download_audio(url: str) -> Path:
                         detail=f"Failed to download audio: HTTP {response.status_code}"
                     )
 
-                extension = ".wav" if ".wav" in url.lower() else ".mp3"
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=extension)
+                suffix = ".wav" if ".wav" in url.lower() else ".mp3"
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
 
                 total_size = 0
                 async for chunk in response.aiter_bytes(chunk_size=8192):
@@ -120,12 +119,13 @@ def extract_audio_features(audio_path: Path) -> dict:
     Safe for Render free tier (512MB)
     """
     try:
-        # 🔥 SAFE SETTINGS (Render-friendly)
+        warnings.filterwarnings("ignore")
+
         y, sr = librosa.load(
             audio_path,
-            sr=16000,
+            sr=16000,       # downsample
             mono=True,
-            duration=20.0
+            duration=20.0  # max 20 seconds
         )
 
         features = {}
@@ -141,7 +141,6 @@ def extract_audio_features(audio_path: Path) -> dict:
         features["rms_mean"] = float(np.mean(rms))
         features["rms_std"] = float(np.std(rms))
 
-        # MFCC reduced → stable + low memory
         mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5)
         for i in range(5):
             features[f"mfcc_{i}_mean"] = float(np.mean(mfccs[i]))
@@ -192,7 +191,7 @@ def analyze_voice_characteristics(features: dict) -> dict:
     }
 
 # --------------------------------------------------
-# Language heuristic (simple & safe)
+# Language heuristic
 # --------------------------------------------------
 def detect_language(features: dict) -> str:
     return "English"
@@ -226,12 +225,11 @@ async def predict_voice(
 
         features = extract_audio_features(audio_path)
         analysis = analyze_voice_characteristics(features)
-        language = detect_language(features)
 
         return PredictionResponse(
             classification=analysis["classification"],
             confidence=analysis["confidence"],
-            language=language,
+            language=detect_language(features),
             explanation=analysis["explanation"]
         )
 

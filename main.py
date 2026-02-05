@@ -3,6 +3,12 @@ AI-Voice Detection API
 A FastAPI backend for detecting AI-generated voices from audio URLs.
 """
 
+# --------------------------------------------------
+# 🔥 CRITICAL: Disable numba JIT BEFORE importing librosa
+# --------------------------------------------------
+import os
+os.environ["NUMBA_DISABLE_JIT"] = "1"
+
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -14,7 +20,6 @@ import httpx
 import librosa
 import numpy as np
 import tempfile
-import os
 import logging
 
 # --------------------------------------------------
@@ -107,38 +112,40 @@ async def download_audio(url: str) -> Path:
         raise HTTPException(status_code=400, detail=f"Failed to download audio: {str(e)}")
 
 # --------------------------------------------------
-# Feature extraction
+# Feature extraction (MEMORY SAFE)
 # --------------------------------------------------
 def extract_audio_features(audio_path: Path) -> dict:
+    """
+    Memory-optimized audio feature extraction
+    Safe for Render free tier (512MB)
+    """
     try:
-        y, sr = librosa.load(audio_path, sr=None, duration=60)
+        # 🔥 SAFE SETTINGS (Render-friendly)
+        y, sr = librosa.load(
+            audio_path,
+            sr=16000,
+            mono=True,
+            duration=20.0
+        )
 
         features = {}
 
-        sc = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        sb = librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
-
-        features["spectral_centroid_mean"] = np.mean(sc)
-        features["spectral_centroid_std"] = np.std(sc)
-        features["spectral_bandwidth_mean"] = np.mean(sb)
-        features["spectral_bandwidth_std"] = np.std(sb)
-
+        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
         zcr = librosa.feature.zero_crossing_rate(y)[0]
-        features["zcr_mean"] = np.mean(zcr)
-        features["zcr_std"] = np.std(zcr)
-
-        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-        for i in range(13):
-            features[f"mfcc_{i}_mean"] = np.mean(mfccs[i])
-            features[f"mfcc_{i}_std"] = np.std(mfccs[i])
-
         rms = librosa.feature.rms(y=y)[0]
-        features["rms_mean"] = np.mean(rms)
-        features["rms_std"] = np.std(rms)
 
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        features["tempo"] = tempo
-        features["duration"] = librosa.get_duration(y=y, sr=sr)
+        features["spectral_centroid_mean"] = float(np.mean(spectral_centroids))
+        features["spectral_centroid_std"] = float(np.std(spectral_centroids))
+        features["zcr_mean"] = float(np.mean(zcr))
+        features["zcr_std"] = float(np.std(zcr))
+        features["rms_mean"] = float(np.mean(rms))
+        features["rms_std"] = float(np.std(rms))
+
+        # MFCC reduced → stable + low memory
+        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5)
+        for i in range(5):
+            features[f"mfcc_{i}_mean"] = float(np.mean(mfccs[i]))
+            features[f"mfcc_{i}_std"] = float(np.std(mfccs[i]))
 
         return features
 
@@ -156,9 +163,9 @@ def analyze_voice_characteristics(features: dict) -> dict:
     reasons = []
 
     sc_var = features["spectral_centroid_std"] / (features["spectral_centroid_mean"] + 1e-6)
-    if sc_var < 0.15:
+    if sc_var < 0.2:
         score += 0.2
-        reasons.append("highly consistent spectral properties")
+        reasons.append("consistent spectral properties")
     else:
         score -= 0.2
         reasons.append("natural spectral variation")
@@ -175,7 +182,7 @@ def analyze_voice_characteristics(features: dict) -> dict:
     classification = "AI Generated" if confidence > 0.55 else "Human"
 
     explanation = f"Analysis suggests {classification.lower()} voice: {', '.join(reasons)}"
-    if confidence < 0.2 or confidence > 0.8:
+    if confidence < 0.25 or confidence > 0.8:
         explanation += " (high confidence)"
 
     return {
@@ -185,14 +192,9 @@ def analyze_voice_characteristics(features: dict) -> dict:
     }
 
 # --------------------------------------------------
-# Language heuristic
+# Language heuristic (simple & safe)
 # --------------------------------------------------
 def detect_language(features: dict) -> str:
-    tempo = features.get("tempo", 120)
-    if tempo < 100:
-        return "Spanish"
-    if tempo > 130:
-        return "English"
     return "English"
 
 # --------------------------------------------------

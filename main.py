@@ -1,6 +1,7 @@
 import os
 import tempfile
 import logging
+import base64
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -10,7 +11,7 @@ from scipy.signal import find_peaks
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import httpx
 
 # --------------------------------------------------
@@ -41,7 +42,10 @@ def verify_token(x_api_key: str = Header(None)):
 # Models
 # --------------------------------------------------
 class AudioRequest(BaseModel):
-    audio_url: str = Field(..., description="Public audio URL")
+    audio_url: str | None = None
+    audioBase64: str | None = None
+    audioFormat: str | None = None
+    language: str | None = "English"
 
 class PredictionResponse(BaseModel):
     classification: str
@@ -50,7 +54,7 @@ class PredictionResponse(BaseModel):
     explanation: str
 
 # --------------------------------------------------
-# Audio download
+# Audio helpers
 # --------------------------------------------------
 async def download_audio(url: str) -> Path:
     async with httpx.AsyncClient(timeout=30) as client:
@@ -62,6 +66,18 @@ async def download_audio(url: str) -> Path:
         tmp.write(r.content)
         tmp.close()
         return Path(tmp.name)
+
+def save_base64_audio(data: str, fmt: str | None) -> Path:
+    try:
+        audio_bytes = base64.b64decode(data)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 audio")
+
+    suffix = f".{fmt}" if fmt else ".wav"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(audio_bytes)
+    tmp.close()
+    return Path(tmp.name)
 
 # --------------------------------------------------
 # Feature extraction (SAFE – no librosa / no numba)
@@ -86,7 +102,7 @@ def extract_features(path: Path) -> dict:
 # --------------------------------------------------
 # Analysis
 # --------------------------------------------------
-def analyze(features: dict) -> dict:
+def analyze(features: dict, language: str) -> dict:
     score = 0.5
     reasons = []
 
@@ -104,7 +120,7 @@ def analyze(features: dict) -> dict:
     return {
         "classification": label,
         "confidence": confidence,
-        "language": "English",
+        "language": language,
         "explanation": f"Analysis suggests {label.lower()} voice: {', '.join(reasons)}"
     }
 
@@ -117,17 +133,27 @@ async def root():
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(req: AudioRequest, token: str = Depends(verify_token)):
-    parsed = urlparse(req.audio_url)
-    path = None
+    path: Path | None = None
     try:
-        if parsed.scheme in ("http", "https"):
+        # Case 1: audio_url (Swagger / curl / judge)
+        if req.audio_url:
+            parsed = urlparse(req.audio_url)
+            if parsed.scheme not in ("http", "https"):
+                raise HTTPException(status_code=400, detail="Invalid audio URL")
             path = await download_audio(req.audio_url)
+
+        # Case 2: audioBase64 (Hackathon tester)
+        elif req.audioBase64:
+            path = save_base64_audio(req.audioBase64, req.audioFormat)
+
         else:
-            raise HTTPException(status_code=400, detail="Invalid audio URL")
+            raise HTTPException(
+                status_code=422,
+                detail="audio_url or audioBase64 required"
+            )
 
         features = extract_features(path)
-        result = analyze(features)
-        return result
+        return analyze(features, req.language or "English")
 
     finally:
         if path and path.exists():

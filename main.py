@@ -180,8 +180,12 @@ def analyze_voice_characteristics(features: dict) -> dict:
     confidence = float(np.clip(score, 0, 1))
     classification = "AI Generated" if confidence > 0.55 else "Human"
 
-    explanation = f"Analysis suggests {classification.lower()} voice: {', '.join(reasons)}"
-    if confidence < 0.25 or confidence > 0.8:
+    explanation = (
+        f"Analysis suggests {classification} voice: "
+        + ", ".join(reasons)
+    )
+
+    if confidence > 0.8 or confidence < 0.25:
         explanation += " (high confidence)"
 
     return {
@@ -189,6 +193,7 @@ def analyze_voice_characteristics(features: dict) -> dict:
         "confidence": round(confidence, 2),
         "explanation": explanation
     }
+
 
 # --------------------------------------------------
 # Language heuristic

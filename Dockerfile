@@ -1,33 +1,33 @@
-# Use Python 3.11 slim image
-FROM python:3.11-slim
+# ✅ Python 3.10 (numba + librosa compatible)
+FROM python:3.10-slim
 
 # Set working directory
 WORKDIR /app
 
-# 🔥 CRITICAL: Disable numba JIT globally (before app runs)
-ENV NUMBA_DISABLE_JIT=1
-
-# Install system dependencies required for librosa and audio processing
+# System dependencies for audio
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
     libsndfile1 \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
+# 🔥 Disable numba JIT BEFORE Python imports
+ENV NUMBA_DISABLE_JIT=1
+
+# Copy requirements
 COPY requirements.txt .
 
-# Install Python dependencies
+# Install Python deps
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy app
 COPY main.py .
 
-# Create non-root user (optional but safe)
-RUN useradd -m -u 1000 apiuser && chown -R apiuser:apiuser /app
+# Security: non-root user
+RUN useradd -m apiuser
 USER apiuser
 
-# Expose port (Render ignores EXPOSE but it's fine)
+# Expose port (Render ignores but OK)
 EXPOSE 8000
 
-# Run the application (Render-compatible, dynamic port)
+# Render-compatible start
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

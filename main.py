@@ -43,14 +43,27 @@ TIMEOUT_SECONDS = 30
 # --------------------------------------------------
 # Security
 # --------------------------------------------------
-security = HTTPBearer()
+from fastapi import Header
 
 async def verify_token(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None)
 ):
-    if credentials.credentials != VALID_BEARER_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid authentication token")
-    return credentials.credentials
+    token = None
+
+    # Case 1: Normal Authorization header
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.replace("Bearer ", "").strip()
+
+    # Case 2: Hackathon tester (x-api-key)
+    elif x_api_key:
+        token = x_api_key.strip()
+
+    if token != VALID_BEARER_TOKEN:
+        raise HTTPException(status_code=403, detail="Not authenticated")
+
+    return token
+
 
 # --------------------------------------------------
 # Models

@@ -8,9 +8,8 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import find_peaks
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import httpx
 
@@ -29,15 +28,14 @@ app = FastAPI(
 )
 
 # --------------------------------------------------
-# Security
+# Security (HACKATHON COMPATIBLE)
 # --------------------------------------------------
-security = HTTPBearer()
-VALID_BEARER_TOKEN = "hackathon_2024_secret_token"
+VALID_API_KEY = "hackathon_2024_secret_token"
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != VALID_BEARER_TOKEN:
+def verify_token(x_api_key: str = Header(None)):
+    if x_api_key != VALID_API_KEY:
         raise HTTPException(status_code=403, detail="Not authenticated")
-    return credentials.credentials
+    return x_api_key
 
 # --------------------------------------------------
 # Models
@@ -66,22 +64,22 @@ async def download_audio(url: str) -> Path:
         return Path(tmp.name)
 
 # --------------------------------------------------
-# Feature extraction (SAFE)
+# Feature extraction (SAFE – no librosa / no numba)
 # --------------------------------------------------
 def extract_features(path: Path) -> dict:
     audio, sr = sf.read(path)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
 
-    energy = np.mean(audio ** 2)
-    zero_crossings = np.mean(np.abs(np.diff(np.sign(audio))))
+    energy = float(np.mean(audio ** 2))
+    zcr = float(np.mean(np.abs(np.diff(np.sign(audio)))))
 
     peaks, _ = find_peaks(np.abs(audio), height=np.std(audio))
-    peak_density = len(peaks) / len(audio)
+    peak_density = float(len(peaks) / len(audio))
 
     return {
         "energy": energy,
-        "zcr": zero_crossings,
+        "zcr": zcr,
         "peak_density": peak_density
     }
 

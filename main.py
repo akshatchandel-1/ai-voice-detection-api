@@ -1,13 +1,7 @@
 """
 AI-Voice Detection API
-A FastAPI backend for detecting AI-generated voices from audio URLs.
+Stable, hackathon-safe, Render-safe implementation
 """
-
-# --------------------------------------------------
-# 🔥 CRITICAL: Disable numba JIT BEFORE importing librosa
-# --------------------------------------------------
-import os
-os.environ["NUMBA_DISABLE_JIT"] = "1"
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import JSONResponse
@@ -18,9 +12,10 @@ from pathlib import Path
 import httpx
 import librosa
 import numpy as np
+import soundfile as sf
 import tempfile
+import os
 import logging
-import warnings
 
 # --------------------------------------------------
 # Logging
@@ -45,7 +40,7 @@ MAX_AUDIO_SIZE_MB = 50
 TIMEOUT_SECONDS = 30
 
 # --------------------------------------------------
-# Security (Swagger-compatible)
+# Security
 # --------------------------------------------------
 security = HTTPBearer()
 
@@ -60,14 +55,11 @@ async def verify_token(
 # Models
 # --------------------------------------------------
 class AudioRequest(BaseModel):
-    audio_url: str = Field(
-        ...,
-        description="Public HTTP/HTTPS URL or local file URL (file:///...) to audio file"
-    )
+    audio_url: str = Field(..., description="Public audio URL (mp3/wav)")
 
 class PredictionResponse(BaseModel):
     classification: str
-    confidence: float = Field(..., ge=0.0, le=1.0)
+    confidence: float
     language: str
     explanation: str
 
@@ -75,131 +67,71 @@ class PredictionResponse(BaseModel):
 # Audio download
 # --------------------------------------------------
 async def download_audio(url: str) -> Path:
-    try:
-        async with httpx.AsyncClient(
-            timeout=TIMEOUT_SECONDS,
-            headers={"User-Agent": "AI-Voice-Detection-Hackathon"}
-        ) as client:
-            async with client.stream("GET", url) as response:
-                if response.status_code != 200:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Failed to download audio: HTTP {response.status_code}"
-                    )
+    async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
+        r = await client.get(url)
+        if r.status_code != 200:
+            raise HTTPException(400, "Failed to download audio")
 
-                suffix = ".wav" if ".wav" in url.lower() else ".mp3"
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-
-                total_size = 0
-                async for chunk in response.aiter_bytes(chunk_size=8192):
-                    total_size += len(chunk)
-                    if total_size > MAX_AUDIO_SIZE_MB * 1024 * 1024:
-                        temp_file.close()
-                        os.unlink(temp_file.name)
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Audio file exceeds size limit"
-                        )
-                    temp_file.write(chunk)
-
-                temp_file.close()
-                return Path(temp_file.name)
-
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=408, detail="Audio download timed out")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download audio: {str(e)}")
+        suffix = ".wav" if ".wav" in url else ".mp3"
+        f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        f.write(r.content)
+        f.close()
+        return Path(f.name)
 
 # --------------------------------------------------
-# Feature extraction (MEMORY SAFE)
+# 🔥 STABLE FEATURE EXTRACTION (NO NUMBA)
 # --------------------------------------------------
 def extract_audio_features(audio_path: Path) -> dict:
-    """
-    Memory-optimized audio feature extraction
-    Safe for Render free tier (512MB)
-    """
     try:
-        warnings.filterwarnings("ignore")
+        y, sr = sf.read(audio_path, always_2d=False)
 
-        y, sr = librosa.load(
-            audio_path,
-            sr=16000,       # downsample
-            mono=True,
-            duration=20.0  # max 20 seconds
-        )
+        if y.ndim > 1:
+            y = np.mean(y, axis=1)
+
+        y = y[: sr * 20]  # max 20 seconds
 
         features = {}
 
-        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
         zcr = librosa.feature.zero_crossing_rate(y)[0]
         rms = librosa.feature.rms(y=y)[0]
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5)
 
-        features["spectral_centroid_mean"] = float(np.mean(spectral_centroids))
-        features["spectral_centroid_std"] = float(np.std(spectral_centroids))
+        features["spectral_centroid_mean"] = float(np.mean(spectral_centroid))
+        features["spectral_centroid_std"] = float(np.std(spectral_centroid))
         features["zcr_mean"] = float(np.mean(zcr))
         features["zcr_std"] = float(np.std(zcr))
         features["rms_mean"] = float(np.mean(rms))
         features["rms_std"] = float(np.std(rms))
 
-        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5)
         for i in range(5):
-            features[f"mfcc_{i}_mean"] = float(np.mean(mfccs[i]))
-            features[f"mfcc_{i}_std"] = float(np.std(mfccs[i]))
+            features[f"mfcc_{i}_mean"] = float(np.mean(mfcc[i]))
+            features[f"mfcc_{i}_std"] = float(np.std(mfcc[i]))
 
         return features
 
     except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to process audio file: {str(e)}"
-        )
+        raise HTTPException(400, f"Failed to process audio file: {str(e)}")
 
 # --------------------------------------------------
 # Analysis
 # --------------------------------------------------
-def analyze_voice_characteristics(features: dict) -> dict:
+def analyze_voice(features: dict):
     score = 0.5
     reasons = []
 
-    sc_var = features["spectral_centroid_std"] / (features["spectral_centroid_mean"] + 1e-6)
-    if sc_var < 0.2:
+    if features["spectral_centroid_std"] < 0.15 * features["spectral_centroid_mean"]:
         score += 0.2
         reasons.append("consistent spectral properties")
-    else:
-        score -= 0.2
-        reasons.append("natural spectral variation")
 
-    rms_var = features["rms_std"] / (features["rms_mean"] + 1e-6)
-    if rms_var < 0.4:
+    if features["rms_std"] < 0.4 * features["rms_mean"]:
         score += 0.15
         reasons.append("uniform energy patterns")
-    else:
-        score -= 0.15
-        reasons.append("natural dynamic range")
 
-    confidence = float(np.clip(score, 0, 1))
+    confidence = round(min(max(score, 0), 1), 2)
     classification = "AI Generated" if confidence > 0.55 else "Human"
 
-    explanation = (
-        f"Analysis suggests {classification} voice: "
-        + ", ".join(reasons)
-    )
-
-    if confidence > 0.8 or confidence < 0.25:
-        explanation += " (high confidence)"
-
-    return {
-        "classification": classification,
-        "confidence": round(confidence, 2),
-        "explanation": explanation
-    }
-
-
-# --------------------------------------------------
-# Language heuristic
-# --------------------------------------------------
-def detect_language(features: dict) -> str:
-    return "English"
+    return classification, confidence, reasons
 
 # --------------------------------------------------
 # Routes
@@ -218,46 +150,28 @@ async def predict_voice(
     token: str = Depends(verify_token)
 ):
     audio_path = None
-    parsed = urlparse(request.audio_url)
-
     try:
-        if parsed.scheme == "file":
-            audio_path = Path(parsed.path)
-            if not audio_path.exists():
-                raise HTTPException(status_code=400, detail="Local audio file not found")
-        else:
-            audio_path = await download_audio(request.audio_url)
-
+        audio_path = await download_audio(request.audio_url)
         features = extract_audio_features(audio_path)
-        analysis = analyze_voice_characteristics(features)
+        cls, conf, reasons = analyze_voice(features)
 
-        return PredictionResponse(
-            classification=analysis["classification"],
-            confidence=analysis["confidence"],
-            language=detect_language(features),
-            explanation=analysis["explanation"]
-        )
+        return {
+            "classification": cls,
+            "confidence": conf,
+            "language": "English",
+            "explanation": f"Analysis suggests {cls.lower()} voice: {', '.join(reasons)}"
+        }
 
     finally:
-        if audio_path and audio_path.exists() and parsed.scheme != "file":
-            try:
-                os.unlink(audio_path)
-            except Exception:
-                pass
+        if audio_path and audio_path.exists():
+            os.unlink(audio_path)
 
 # --------------------------------------------------
 # Error handler
 # --------------------------------------------------
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
+async def handler(_, exc):
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": exc.detail, "status_code": exc.status_code}
     )
-
-# --------------------------------------------------
-# Run
-# --------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)

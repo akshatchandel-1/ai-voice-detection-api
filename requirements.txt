@@ -2,6 +2,11 @@ fastapi==0.109.0
 uvicorn[standard]==0.27.0
 pydantic==2.5.3
 httpx==0.26.0
+
+# 🔥 Audio stack (Python 3.10 safe)
+librosa==0.10.1
 numpy==1.23.5
+scipy==1.11.4
 soundfile==0.12.1
+
 python-multipart==0.0.6
